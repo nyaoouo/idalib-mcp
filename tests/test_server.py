@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any
@@ -16,10 +17,15 @@ from idalib_mcp.server import (
 
 
 class FakeMcp:
+    class _Registry:
+        def __init__(self):
+            self.dispatch = lambda req: None
+
     def __init__(self) -> None:
         self._http_server: FakeHttpServer | None = None
         self.fail_ports: set[int] = set()
         self.serve_calls: list[tuple[str, int, bool, type]] = []
+        self.registry = self._Registry()
 
     def _mcp_tools_list(self) -> dict[str, Any]:
         return {
@@ -43,17 +49,20 @@ class FakeHttpServer:
 
 
 class FakeSession:
-    def __init__(self, backend: str) -> None:
+    def __init__(self, backend: str = "") -> None:
         self.backend = backend
+        self.session_id = ""
 
 
 class FakeSupervisor:
     def __init__(self) -> None:
+        from idalib_mcp.cancellation import CancellationRegistry
         self.opened: tuple[str, str] | None = None
         self.forwarded: tuple[str, dict[str, Any]] | None = None
         self.sessions: dict[str, FakeSession] = {}
         self.saved: tuple[FakeSession, str, dict[str, Any]] | None = None
         self.save_result: dict[str, Any] = {"ok": True, "path": "sample.i64"}
+        self._cancels = CancellationRegistry()
 
     def worker_tools(self) -> list[dict[str, Any]]:
         return [
@@ -84,9 +93,36 @@ class FakeSupervisor:
         return self.save_result
 
 
+class FakeIdalibSupervisor:
+    """Minimal base class that mimics upstream.IdalibSupervisor for tests."""
+
+    def __init__(self, *args, isolated_contexts: bool = False, max_workers: int = 4, **kwargs):
+        import threading
+        self._lock = threading.RLock()
+        self.isolated_contexts = isolated_contexts
+        self.max_workers = max_workers
+        self.sessions: dict = {}
+        self.worker_args = list(kwargs.get("worker_args") or [])
+        self._tools_cache: dict = {}
+
+    def close_session(self, session_id):
+        return False
+
+    def _worker_request_path(self):
+        return "/mcp"
+
+    def forward_raw(self, worker, request_obj):
+        return self._worker_rpc(worker, request_obj)
+
+    def _worker_rpc(self, worker, request_obj, *, timeout=None):
+        raise NotImplementedError
+
+
 class FakeUpstream:
     IDALIB_MANAGEMENT_TOOLS = {"idalib_open", "idalib_list"}
     IDALIB_HIDDEN_PLUGIN_TOOLS = {"jump_to_address"}
+
+    IdalibSupervisor = FakeIdalibSupervisor
 
     def __init__(self) -> None:
         self.mcp = FakeMcp()
@@ -184,6 +220,262 @@ class ServerIntegrationPatchTests(unittest.TestCase):
         session, forwarded = upstream.supervisor.forwarded
         self.assertEqual(session, "opened-session")
         self.assertEqual(forwarded["params"]["arguments"], {"addr": "0x401000"})
+
+
+class SupervisorDispatcherIntegrationTests(unittest.TestCase):
+    def _build_supervisor(self):
+        from idalib_mcp.server import _build_managed_supervisor_class
+
+        upstream = FakeUpstream()
+        cls = _build_managed_supervisor_class(upstream)
+        supervisor = cls(FakeMcp(), worker_args=[])
+        return supervisor
+
+    def test_get_or_create_dispatcher_returns_same_instance(self) -> None:
+        supervisor = self._build_supervisor()
+        d1 = supervisor.get_or_create_dispatcher("session-a")
+        d2 = supervisor.get_or_create_dispatcher("session-a")
+        self.assertIs(d1, d2)
+
+    def test_close_session_drops_dispatcher(self) -> None:
+        supervisor = self._build_supervisor()
+        supervisor.get_or_create_dispatcher("session-a")
+        # close_session calls super().close_session which uses sessions dict;
+        # FakeUpstream has no session 'session-a', so close returns False.
+        supervisor.close_session("session-a")
+        # The override must still drop the dispatcher entry.
+        self.assertNotIn("session-a", supervisor._dispatchers)
+
+    def test_call_worker_rpc_with_cancel_aborts_on_event(self) -> None:
+        import http.server, socketserver, threading as th, time
+
+        supervisor = self._build_supervisor()
+
+        # Spin up a tiny HTTP server that sleeps so we can cancel it mid-call.
+        class SlowHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                import time as _t
+                _t.sleep(2.0)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"jsonrpc":"2.0","result":{},"id":1}')
+
+            def log_message(self, *args, **kwargs):
+                pass
+
+        class QuietTCPServer(socketserver.TCPServer):
+            def handle_error(self, request, client_address):
+                pass
+
+        srv = QuietTCPServer(("127.0.0.1", 0), SlowHandler)
+        port = srv.server_address[1]
+        srv_thread = th.Thread(target=srv.serve_forever, daemon=True)
+        srv_thread.start()
+
+        class FakeWorker:
+            host = "127.0.0.1"
+
+        worker = FakeWorker()
+        worker.port = port
+
+        cancel = th.Event()
+        th.Timer(0.2, cancel.set).start()
+
+        from idalib_mcp.dispatcher import CancelledError
+        try:
+            t0 = time.monotonic()
+            with self.assertRaises(CancelledError):
+                supervisor._call_worker_rpc_with_cancel(
+                    worker,
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                     "params": {"name": "noop", "arguments": {}}},
+                    cancel,
+                )
+            elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 1.5, "should abort well before the 2s server sleep")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
+    def test_forward_raw_routes_tools_call_through_dispatcher(self) -> None:
+        supervisor = self._build_supervisor()
+
+        session = FakeSession()
+        session.session_id = "session-a"
+
+        captured: list[dict] = []
+
+        def fake_rpc(worker, request_obj, cancel_event):
+            captured.append(request_obj)
+            return {"jsonrpc": "2.0", "id": request_obj.get("id"),
+                    "result": {"content": [], "isError": False, "structuredContent": {"ok": True}}}
+
+        supervisor._call_worker_rpc_with_cancel = fake_rpc
+
+        response = supervisor.forward_raw(session, {
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {"name": "decompile", "arguments": {"addr": "0x1000"}},
+        })
+
+        self.assertEqual(response["id"], 7)
+        self.assertFalse(response["result"]["isError"])
+        snapshot = supervisor.get_or_create_dispatcher("session-a").snapshot()
+        self.assertEqual(len(snapshot["history"]), 1)
+        self.assertEqual(snapshot["history"][0]["tool"], "decompile")
+
+    def test_forward_raw_bypasses_dispatcher_for_non_tools_call(self) -> None:
+        supervisor = self._build_supervisor()
+        session = FakeSession()
+        session.session_id = "session-a"
+
+        # Replace the base _worker_rpc to confirm bypass.
+        def base_rpc(worker, request_obj, *, timeout=None):
+            return {"jsonrpc": "2.0", "id": request_obj.get("id"), "result": {"ok": True}}
+
+        supervisor._worker_rpc = base_rpc  # type: ignore[assignment]
+
+        response = supervisor.forward_raw(session, {
+            "jsonrpc": "2.0", "id": 9, "method": "resources/list", "params": {},
+        })
+        self.assertEqual(response["result"], {"ok": True})
+        # Dispatcher should not have been created for resources/list.
+        self.assertNotIn("session-a", supervisor._dispatchers)
+
+    def test_error_response_is_decorated_with_tool_schema(self) -> None:
+        supervisor = self._build_supervisor()
+
+        # Seed the cache the supervisor reads schemas from.
+        supervisor._tools_cache[()] = [{
+            "name": "decompile",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"addr": {"type": "string"}},
+                "required": ["addr"],
+            },
+        }]
+
+        response = {
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"content": [{"type": "text", "text": "bad args"}],
+                       "isError": True, "structuredContent": {}},
+        }
+
+        decorated = supervisor._decorate_error("decompile", response)
+        meta = decorated["result"].get("_meta") or {}
+        self.assertEqual(meta.get("tool_schema", {}).get("required"), ["addr"])
+        texts = [c.get("text", "") for c in decorated["result"]["content"]]
+        self.assertTrue(any("Tool schema" in t for t in texts))
+
+
+class OpenUiToolTests(unittest.TestCase):
+    def test_register_open_ui_tool_adds_to_management_set(self) -> None:
+        from idalib_mcp.server import _register_open_ui_tool
+
+        upstream = FakeUpstream()
+        upstream.IDALIB_MANAGEMENT_TOOLS = set(upstream.IDALIB_MANAGEMENT_TOOLS)
+
+        captured = {}
+
+        class FakeMcpWithTool(FakeMcp):
+            def tool(self, func):
+                captured["func"] = func
+                return func
+
+        upstream.mcp = FakeMcpWithTool()
+        _register_open_ui_tool(upstream, host="127.0.0.1", port=8745)
+
+        self.assertIn("idalib_open_ui", upstream.IDALIB_MANAGEMENT_TOOLS)
+        result = captured["func"]()
+        self.assertEqual(result["url"], "http://127.0.0.1:8745/instances")
+
+
+class HistoryEndpointTests(unittest.TestCase):
+    def _build_handler_and_dispatcher(self):
+        from idalib_mcp.dispatcher import WorkerDispatcher
+        from idalib_mcp.server import _build_request_handler
+
+        dispatcher = WorkerDispatcher("session-a")
+        dispatcher.run("ping", 1, {"x": 1}, lambda _c: {"ok": True}, threading.Event())
+        big = "a" * 5000
+        dispatcher.run("big", 2, {"blob": big}, lambda _c: {"blob": big}, threading.Event())
+
+        class Supervisor(FakeSupervisor):
+            def __init__(self):
+                super().__init__()
+                self._dispatchers = {"session-a": dispatcher}
+
+        # Minimal base handler so _build_request_handler can subclass it.
+        class _FakeMcpHttpRequestHandler:
+            pass
+
+        def _fake_serve():
+            pass
+
+        _fake_serve.__globals__["McpHttpRequestHandler"] = _FakeMcpHttpRequestHandler  # type: ignore[attr-defined]
+
+        class _FakeMcpServer:
+            serve = _fake_serve
+
+        class UpstreamWithSupervisor(FakeUpstream):
+            McpServer = _FakeMcpServer
+            supervisor = None
+
+        upstream = UpstreamWithSupervisor()
+        upstream.supervisor = Supervisor()
+        handler_cls = _build_request_handler(upstream)
+        return handler_cls, dispatcher, upstream
+
+    def test_history_snapshot_endpoint(self):
+        handler_cls, dispatcher, upstream = self._build_handler_and_dispatcher()
+        # Bypass network: directly call the routing helper.
+        snapshot = handler_cls._history_snapshot(upstream.supervisor, "session-a")
+        self.assertEqual(len(snapshot["history"]), 2)
+
+    def test_history_payload_returns_full_text(self):
+        handler_cls, dispatcher, upstream = self._build_handler_and_dispatcher()
+        big_record = next(r for r in dispatcher.snapshot()["history"] if r["tool"] == "big")
+        payload_id = big_record["args_full_id"]
+        result = handler_cls._history_payload(
+            upstream.supervisor, "session-a", payload_id,
+        )
+        self.assertIn("a" * 100, result)
+
+    def test_history_payload_returns_none_when_unknown(self):
+        handler_cls, dispatcher, upstream = self._build_handler_and_dispatcher()
+        result = handler_cls._history_payload(
+            upstream.supervisor, "session-a", "unknown.args",
+        )
+        self.assertIsNone(result)
+
+
+class CancellationPatchTests(unittest.TestCase):
+    def _build_supervisor(self):
+        from idalib_mcp.server import _build_managed_supervisor_class
+        upstream = FakeUpstream()
+        cls = _build_managed_supervisor_class(upstream)
+        return upstream, cls(FakeMcp(), worker_args=[])
+
+    def test_notifications_cancelled_sets_event(self):
+        from idalib_mcp.server import _wrap_dispatch_supervisor
+        upstream, supervisor = self._build_supervisor()
+        upstream.supervisor = supervisor
+        original_dispatch_calls: list[dict] = []
+        upstream._original_dispatch = lambda req: original_dispatch_calls.append(req) or None
+        # Seed mcp.registry.dispatch as a callable; _wrap_dispatch_supervisor wraps it.
+        upstream.mcp.registry.dispatch = lambda req: None
+        _wrap_dispatch_supervisor(upstream)
+
+        handle = supervisor._cancels.register(42)
+        # Fire notifications/cancelled and confirm the event sets.
+        response = upstream.mcp.registry.dispatch({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 42},
+        })
+        self.assertIsNone(response)
+        self.assertTrue(handle.event.is_set())
 
 
 if __name__ == "__main__":

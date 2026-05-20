@@ -5,15 +5,19 @@ import importlib
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
+import threading
 import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from .cancellation import CancellationRegistry
 from .config import default_ida_home_from_env, validate_ida_home
+from .dispatcher import CancelledError, WorkerDispatcher
 from .installer import list_available_clients, print_mcp_config, run_install_command
 
 
@@ -40,6 +44,140 @@ def _build_managed_supervisor_class(upstream):
             super().__init__(*args, **kwargs)
             self.ida_home = ida_home
             self.show_worker_io = show_worker_io
+            self._dispatchers: dict[str, WorkerDispatcher] = {}
+            self._cancels = CancellationRegistry()
+
+        def get_or_create_dispatcher(self, session_id: str) -> WorkerDispatcher:
+            with self._lock:
+                dispatcher = self._dispatchers.get(session_id)
+                if dispatcher is None:
+                    dispatcher = WorkerDispatcher(session_id)
+                    self._dispatchers[session_id] = dispatcher
+                return dispatcher
+
+        def close_session(self, session_id: str) -> bool:
+            try:
+                return super().close_session(session_id)
+            finally:
+                with self._lock:
+                    self._dispatchers.pop(session_id, None)
+
+        _RPC_CANCEL_POLL_TIMEOUT = 0.5
+
+        def _call_worker_rpc_with_cancel(
+            self,
+            worker: Any,
+            request_obj: dict[str, Any],
+            cancel_event: threading.Event,
+        ) -> dict[str, Any]:
+            import http.client
+            import socket as _socket
+            body = json.dumps(request_obj).encode("utf-8")
+            path = self._worker_request_path()
+            conn = http.client.HTTPConnection(
+                worker.host, worker.port, timeout=self._RPC_CANCEL_POLL_TIMEOUT
+            )
+            try:
+                if cancel_event.is_set():
+                    raise CancelledError("Cancelled before request")
+                try:
+                    conn.request(
+                        "POST", path, body,
+                        {"Content-Type": "application/json",
+                         "Accept": "application/json, text/event-stream"},
+                    )
+                except (ConnectionError, OSError, http.client.RemoteDisconnected, http.client.BadStatusLine):
+                    if cancel_event.is_set():
+                        raise CancelledError("Cancelled during request")
+                    raise
+                while True:
+                    if cancel_event.is_set():
+                        raise CancelledError("Cancelled before response")
+                    try:
+                        response = conn.getresponse()
+                        break
+                    except (_socket.timeout, TimeoutError):
+                        if cancel_event.is_set():
+                            raise CancelledError("Request cancelled mid-flight")
+                    except (ConnectionError, OSError, http.client.RemoteDisconnected, http.client.BadStatusLine):
+                        if cancel_event.is_set():
+                            raise CancelledError("Request cancelled mid-flight")
+                        raise
+                raw_parts: list[bytes] = []
+                while True:
+                    if cancel_event.is_set():
+                        raise CancelledError("Cancelled during read")
+                    try:
+                        chunk = response.read(65536)
+                        if not chunk:
+                            break
+                        raw_parts.append(chunk)
+                    except (_socket.timeout, TimeoutError):
+                        if cancel_event.is_set():
+                            raise CancelledError("Request cancelled mid-flight")
+                    except (ConnectionError, OSError, http.client.RemoteDisconnected, http.client.BadStatusLine):
+                        if cancel_event.is_set():
+                            raise CancelledError("Request cancelled mid-flight")
+                        raise
+                raw = b"".join(raw_parts).decode("utf-8")
+                if response.status >= 400:
+                    raise RuntimeError(f"HTTP {response.status} {response.reason}: {raw}")
+                return json.loads(raw)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        def forward_raw(self, worker: Any, request_obj: dict[str, Any]) -> dict[str, Any]:
+            method = request_obj.get("method")
+            if method != "tools/call":
+                return super().forward_raw(worker, request_obj)
+
+            params = request_obj.get("params") or {}
+            tool_name = params.get("name", "")
+            arguments = params.get("arguments") or {}
+            json_rpc_id = request_obj.get("id")
+            cancel_event = self._current_cancel_event(json_rpc_id)
+            dispatcher = self.get_or_create_dispatcher(worker.session_id)
+
+            def closure(event: threading.Event) -> dict[str, Any]:
+                return self._call_worker_rpc_with_cancel(worker, request_obj, event)
+
+            response = dispatcher.run(tool_name, json_rpc_id, arguments, closure, cancel_event)
+            return self._decorate_error(tool_name, response)
+
+        def _current_cancel_event(self, request_id: Any) -> threading.Event:
+            with self._cancels._lock:  # noqa: SLF001
+                handle = self._cancels._handles.get(request_id)
+            return handle.event if handle is not None else threading.Event()
+
+        def _decorate_error(self, tool_name: str, response: dict[str, Any]) -> dict[str, Any]:
+            result = response.get("result")
+            if not isinstance(result, dict) or not result.get("isError"):
+                return response
+            schema = self._find_tool_schema(tool_name)
+            if schema is None:
+                return response
+            content = list(result.get("content") or [])
+            content.append({
+                "type": "text",
+                "text": "Tool schema:\n" + json.dumps(schema, indent=2),
+            })
+            result["content"] = content
+            meta = dict(result.get("_meta") or {})
+            meta["tool_schema"] = schema
+            result["_meta"] = meta
+            return response
+
+        def _find_tool_schema(self, tool_name: str) -> dict[str, Any] | None:
+            with self._lock:
+                caches = list(self._tools_cache.values())
+            for tools in caches:
+                for tool in tools:
+                    if tool.get("name") == tool_name:
+                        return tool.get("inputSchema")
+            return None
 
         def _spawn_worker(self):
             port = self._pick_port()
@@ -132,6 +270,20 @@ def _build_request_handler(upstream):
     mcp_http_handler = upstream.McpServer.serve.__globals__["McpHttpRequestHandler"]
 
     class ManagementHttpRequestHandler(mcp_http_handler):  # type: ignore[misc, valid-type]
+        @staticmethod
+        def _history_snapshot(supervisor, session_id: str):
+            dispatcher = supervisor._dispatchers.get(session_id)
+            if dispatcher is None:
+                return None
+            return dispatcher.snapshot()
+
+        @staticmethod
+        def _history_payload(supervisor, session_id: str, payload_id: str):
+            dispatcher = supervisor._dispatchers.get(session_id)
+            if dispatcher is None:
+                return None
+            return dispatcher.get_payload(payload_id)
+
         def do_GET(self):
             parsed = urlparse(self.path)
             if parsed.path in {"/", "/instances"}:
@@ -144,9 +296,49 @@ def _build_request_handler(upstream):
                     return
                 self._send_json(200, _snapshot_instances(self._supervisor()))
                 return
+
+            history_match = re.match(r"^/api/instances/([^/]+)/history$", parsed.path)
+            if history_match:
+                if not self._check_api_request():
+                    return
+                session_id = unquote(history_match.group(1))
+                snapshot = self._history_snapshot(self._supervisor(), session_id)
+                if snapshot is None:
+                    self._send_json(404, {"error": f"No dispatcher for session: {session_id}"})
+                    return
+                self._send_json(200, snapshot)
+                return
+
+            payload_match = re.match(r"^/api/instances/([^/]+)/history/([^/]+)$", parsed.path)
+            if payload_match:
+                if not self._check_api_request():
+                    return
+                session_id = unquote(payload_match.group(1))
+                payload_id = unquote(payload_match.group(2))
+                payload = self._history_payload(self._supervisor(), session_id, payload_id)
+                if payload is None:
+                    self._send_json(404, {"error": "Payload not found or evicted"})
+                    return
+                body = payload.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_cors_headers()
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
             super().do_GET()
 
         def do_POST(self):
+            from .cancellation import set_active_socket
+            set_active_socket(self.connection)
+            try:
+                self._do_POST_inner()
+            finally:
+                set_active_socket(None)
+
+        def _do_POST_inner(self):
             parsed = urlparse(self.path)
             prefix = "/api/instances/"
             suffix = "/close"
@@ -425,6 +617,22 @@ def _build_request_handler(upstream):
             </div>
         </div>
     </div>
+    <div class="modal-backdrop" id="inspectDialog" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="inspectTitle" style="width:min(720px,100%);max-height:80vh;display:flex;flex-direction:column;">
+            <h2 id="inspectTitle">Inspect <code id="inspectSession">-</code></h2>
+            <div style="overflow:auto;flex:1;">
+                <h3 style="margin:8px 0;font-size:14px;">Current</h3>
+                <div id="inspectCurrent" class="empty">Idle</div>
+                <h3 style="margin:8px 0;font-size:14px;">Queued (<span id="inspectQueuedCount">0</span>)</h3>
+                <div id="inspectQueued" class="empty">No queued requests</div>
+                <h3 style="margin:8px 0;font-size:14px;">History (last 100)</h3>
+                <div id="inspectHistory" class="empty">No history</div>
+            </div>
+            <div class="modal-actions">
+                <button id="closeInspect">Close</button>
+            </div>
+        </div>
+    </div>
   <script>
     const rows = document.getElementById('rows');
     const empty = document.getElementById('empty');
@@ -471,7 +679,10 @@ def _build_request_handler(upstream):
         <td>${escapeHtml(session.bound_contexts)}</td>
         <td>${escapeHtml(fmtTime(session.last_accessed))}</td>
         <td class="path" title="${inputPath}">${inputPath}</td>
-        <td><button class="danger" data-close="${sessionId}" ${session.owned === false ? 'disabled' : ''}>Close</button></td>
+        <td>
+          <button data-inspect="${sessionId}">Inspect</button>
+          <button class="danger" data-close="${sessionId}" ${session.owned === false ? 'disabled' : ''}>Close</button>
+        </td>
       `;
       return tr;
     }
@@ -550,6 +761,88 @@ def _build_request_handler(upstream):
     refreshButton.addEventListener('click', () => refresh().catch(error => { statusEl.textContent = error.message; }));
     refresh().catch(error => { statusEl.textContent = error.message; });
     setInterval(() => refresh().catch(error => { statusEl.textContent = error.message; }), 5000);
+
+        const inspectDialog = document.getElementById('inspectDialog');
+        const inspectSession = document.getElementById('inspectSession');
+        const inspectCurrent = document.getElementById('inspectCurrent');
+        const inspectQueued = document.getElementById('inspectQueued');
+        const inspectQueuedCount = document.getElementById('inspectQueuedCount');
+        const inspectHistory = document.getElementById('inspectHistory');
+        const closeInspect = document.getElementById('closeInspect');
+        let inspectInterval = null;
+        let inspectingSession = null;
+
+        function renderRecord(record) {
+            const status = escapeHtml(record.status);
+            const tool = escapeHtml(record.tool);
+            const duration = record.duration_ms == null ? '-' : `${record.duration_ms.toFixed(1)} ms`;
+            const argsPreview = escapeHtml(record.args_preview ?? '');
+            const resultPreview = escapeHtml(record.result_preview ?? '');
+            const argsLink = record.args_full_id
+                ? `<a href="/api/instances/${encodeURIComponent(inspectingSession)}/history/${encodeURIComponent(record.args_full_id)}" target="_blank">view full</a>`
+                : '';
+            const resultLink = record.result_full_id
+                ? `<a href="/api/instances/${encodeURIComponent(inspectingSession)}/history/${encodeURIComponent(record.result_full_id)}" target="_blank">view full</a>`
+                : '';
+            const errorText = record.error ? `<div style="color:var(--danger);">${escapeHtml(record.error)}</div>` : '';
+            return `<div style="padding:8px;border:1px solid var(--line);border-radius:6px;margin-bottom:6px;">
+              <div><strong>${tool}</strong> <span class="pill">${status}</span> <span style="color:var(--muted);">${duration}</span></div>
+              <div style="margin-top:4px;font-size:12px;">args: <code>${argsPreview}</code> ${argsLink}</div>
+              <div style="margin-top:4px;font-size:12px;">result: <code>${resultPreview}</code> ${resultLink}</div>
+              ${errorText}
+            </div>`;
+        }
+
+        async function refreshInspect() {
+            if (!inspectingSession) return;
+            try {
+                const response = await fetch(`/api/instances/${encodeURIComponent(inspectingSession)}/history`, {cache: 'no-store'});
+                if (!response.ok) {
+                    inspectCurrent.innerHTML = '<div class="empty">No dispatcher for this session yet</div>';
+                    inspectQueued.innerHTML = '';
+                    inspectHistory.innerHTML = '';
+                    inspectQueuedCount.textContent = '0';
+                    return;
+                }
+                const data = await response.json();
+                inspectCurrent.innerHTML = data.current ? renderRecord(data.current) : '<div class="empty">Idle</div>';
+                inspectQueued.innerHTML = (data.queued || []).map(renderRecord).join('') || '<div class="empty">No queued requests</div>';
+                inspectQueuedCount.textContent = (data.queued || []).length;
+                inspectHistory.innerHTML = (data.history || []).slice().reverse().map(renderRecord).join('') || '<div class="empty">No history</div>';
+            } catch (error) {
+                inspectCurrent.innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`;
+            }
+        }
+
+        function openInspect(sessionId) {
+            inspectingSession = sessionId;
+            inspectSession.textContent = sessionId;
+            inspectDialog.hidden = false;
+            refreshInspect();
+            inspectInterval = setInterval(refreshInspect, 5000);
+        }
+
+        function closeInspectDialog() {
+            inspectDialog.hidden = true;
+            inspectingSession = null;
+            if (inspectInterval) {
+                clearInterval(inspectInterval);
+                inspectInterval = null;
+            }
+        }
+
+        rows.addEventListener('click', event => {
+            const button = event.target.closest('button[data-inspect]');
+            if (!button) return;
+            openInspect(button.dataset.inspect);
+        });
+        closeInspect.addEventListener('click', closeInspectDialog);
+        inspectDialog.addEventListener('click', event => {
+            if (event.target === inspectDialog) closeInspectDialog();
+        });
+        document.addEventListener('keydown', event => {
+            if (event.key === 'Escape' && !inspectDialog.hidden) closeInspectDialog();
+        });
   </script>
 </body>
 </html>"""
@@ -624,6 +917,8 @@ def _enable_path_database_auto_open(upstream) -> None:
             return supervisor.open_session(str(candidate), context_id=context_id)
 
     def _handle_tools_call_with_path_open(request_obj: dict[str, Any]) -> dict[str, Any] | None:
+        from .cancellation import get_active_socket, spawn_socket_watcher
+
         supervisor = upstream._require_supervisor()
         params = request_obj.get("params") or {}
         tool_name = params.get("name", "")
@@ -659,15 +954,62 @@ def _enable_path_database_auto_open(upstream) -> None:
         forwarded = dict(request_obj)
         forwarded["params"] = dict(params)
         forwarded["params"]["arguments"] = arguments
+
+        handle = supervisor._cancels.register(request_id) if request_id is not None else None
+        sock = get_active_socket()
+        stop = threading.Event()
+        watcher = spawn_socket_watcher(handle, sock, stop) if (handle and sock) else None
         try:
             return supervisor.forward_raw(session, forwarded)
+        except CancelledError:
+            return upstream._jsonrpc_result(
+                request_id,
+                upstream._call_tool_result({"error": "Request cancelled"}, is_error=True),
+            )
         except Exception as exc:
             return upstream._jsonrpc_result(
                 request_id,
                 upstream._call_tool_result({"error": str(exc)}, is_error=True),
             )
+        finally:
+            stop.set()
+            if watcher is not None:
+                watcher.join(timeout=1.0)
+            if handle is not None and request_id is not None:
+                supervisor._cancels.unregister(request_id)
 
     upstream._handle_tools_call = _handle_tools_call_with_path_open
+
+
+def _register_open_ui_tool(upstream, *, host: str, port: int) -> None:
+    def idalib_open_ui() -> dict:
+        """Return the bound management UI URL."""
+        return {"url": _bound_instance_ui_url(upstream.mcp, host, port)}
+
+    idalib_open_ui.__doc__ = "Return the bound management UI URL."
+    upstream.mcp.tool(idalib_open_ui)
+    upstream.IDALIB_MANAGEMENT_TOOLS.add("idalib_open_ui")
+
+
+def _wrap_dispatch_supervisor(upstream) -> None:
+    original = upstream.mcp.registry.dispatch
+
+    def wrapped(request):
+        request_obj = request
+        if not isinstance(request, dict):
+            try:
+                request_obj = json.loads(request)
+            except Exception:
+                request_obj = None
+        if isinstance(request_obj, dict) and request_obj.get("method") == "notifications/cancelled":
+            params = request_obj.get("params") or {}
+            target = params.get("requestId")
+            if target is not None and upstream.supervisor is not None:
+                upstream.supervisor._cancels.cancel(target)
+            return None
+        return original(request)
+
+    upstream.mcp.registry.dispatch = wrapped
 
 
 def main() -> None:
@@ -789,7 +1131,9 @@ def main() -> None:
     )
     _prefer_management_tools_in_tool_list(upstream)
     _enable_path_database_auto_open(upstream)
+    _register_open_ui_tool(upstream, host=args.host, port=args.port)
     upstream.mcp.registry.dispatch = upstream.dispatch_supervisor
+    _wrap_dispatch_supervisor(upstream)
     upstream.mcp.require_streamable_http_session = args.isolated_contexts
 
     if args.input_path is not None:
@@ -819,7 +1163,21 @@ def main() -> None:
             upstream.mcp.stdio()
         else:
             logger.info("Instance UI: %s", _instance_ui_url(args.host, args.port))
-            upstream.mcp.serve(host=args.host, port=args.port, background=False, request_handler=handler)
+            stop = threading.Event()
+
+            def threaded_cleanup(signum, frame):
+                stop.set()
+
+            signal.signal(signal.SIGINT, threaded_cleanup)
+            signal.signal(signal.SIGTERM, threaded_cleanup)
+
+            upstream.mcp.serve(
+                host=args.host, port=args.port, background=True, request_handler=handler,
+            )
+            try:
+                stop.wait()
+            finally:
+                upstream.mcp.stop()
     finally:
         if upstream.supervisor is not None:
             upstream.supervisor.shutdown()
