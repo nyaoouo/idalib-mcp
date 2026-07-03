@@ -41,11 +41,42 @@ def _json_bytes(payload: Any) -> bytes:
 def _build_managed_supervisor_class(upstream):
     class ManagedIdalibSupervisor(upstream.IdalibSupervisor):  # type: ignore[misc]
         def __init__(self, *args, ida_home: Path | None = None, show_worker_io: bool = False, **kwargs):
+            self.isolated_contexts = kwargs.pop('isolated_contexts', False)
             super().__init__(*args, **kwargs)
             self.ida_home = ida_home
             self.show_worker_io = show_worker_io
             self._dispatchers: dict[str, WorkerDispatcher] = {}
             self._cancels = CancellationRegistry()
+            self._last_user_activity: dict[str, float] = {}
+            self._last_auto_save: dict[str, float] = {}
+            self._start_auto_save_heartbeat()
+
+        def _start_auto_save_heartbeat(self) -> None:
+            import time as _time
+
+            def _beat() -> None:
+                while True:
+                    threading.Event().wait(20)
+                    sessions = getattr(self, "sessions", {})
+                    for _sid, _sess in list(sessions.items()):
+                        try:
+                            if getattr(_sess, "backend", "") != "worker":
+                                continue
+                            if not _sess.is_alive():
+                                self._last_user_activity.pop(_sid, None)
+                                self._last_auto_save.pop(_sid, None)
+                                continue
+                            _user_act = self._last_user_activity.get(_sid, 0)
+                            _last_save = self._last_auto_save.get(_sid, 0)
+                            if _time.time() - _user_act >= 20 and _user_act > _last_save:
+                                _path = str(Path(_sess.input_path).with_suffix(".i64"))
+                                self.call_worker_tool(_sess, "idb_save", {"path": _path})
+                                self._last_auto_save[_sid] = _time.time()
+                        except Exception:
+                            pass
+
+            t = threading.Thread(target=_beat, daemon=True, name="auto-save")
+            t.start()
 
         def get_or_create_dispatcher(self, session_id: str) -> WorkerDispatcher:
             with self._lock:
@@ -57,10 +88,16 @@ def _build_managed_supervisor_class(upstream):
 
         def close_session(self, session_id: str) -> bool:
             try:
-                return super().close_session(session_id)
+                session = self.resolve_session(session_id)
+                self._discard_opened_worker_session(session)
+                return True
+            except Exception:
+                return False
             finally:
                 with self._lock:
                     self._dispatchers.pop(session_id, None)
+                self._last_user_activity.pop(session_id, None)
+                self._last_auto_save.pop(session_id, None)
 
         _RPC_CANCEL_POLL_TIMEOUT = 0.5
 
@@ -136,6 +173,11 @@ def _build_managed_supervisor_class(upstream):
 
             params = request_obj.get("params") or {}
             tool_name = params.get("name", "")
+            # Track real user activity (exclude auto-save itself)
+            import time as _time
+            if tool_name != "idb_save":
+                sid = getattr(worker, "session_id", "")
+                self._last_user_activity[sid] = _time.time()
             arguments = params.get("arguments") or {}
             json_rpc_id = request_obj.get("id")
             cancel_event = self._current_cancel_event(json_rpc_id)
@@ -228,19 +270,22 @@ def _build_managed_supervisor_class(upstream):
 
 
 def _snapshot_instances(supervisor: Any) -> dict[str, Any]:
-    with supervisor._lock:
+    lock = getattr(supervisor, "_lock", threading.Lock())
+    with lock:
+        context_bindings = getattr(supervisor, "context_bindings", {})
         binding_counts: dict[str, int] = {}
-        for session_id in supervisor.context_bindings.values():
+        for session_id in context_bindings.values():
             binding_counts[session_id] = binding_counts.get(session_id, 0) + 1
 
+        sessions_dict = getattr(supervisor, "sessions", {})
         sessions = [
-            session.to_list_dict(current=False, bound_contexts=binding_counts.get(session.session_id, 0))
-            for session in supervisor.sessions.values()
+            session.to_list_dict()
+            for session in sessions_dict.values()
         ]
 
         owned_workers = sum(
             1
-            for session in supervisor.sessions.values()
+            for session in sessions_dict.values()
             if session.backend == "worker" and session.owned and session.is_alive()
         )
 
@@ -248,22 +293,43 @@ def _snapshot_instances(supervisor: Any) -> dict[str, Any]:
             "sessions": sessions,
             "count": len(sessions),
             "owned_workers": owned_workers,
-            "max_workers": supervisor.max_workers,
-            "isolated_contexts": supervisor.isolated_contexts,
-            "ida_home": str(supervisor.ida_home) if getattr(supervisor, "ida_home", None) else None,
+            "max_workers": getattr(supervisor, "max_workers", 0),
+            "isolated_contexts": getattr(supervisor, "isolated_contexts", False),
+            "ida_home": str(getattr(supervisor, "ida_home", "")) or None,
         }
 
 
 def _save_session_before_close(supervisor: Any, session_id: str) -> dict[str, Any]:
     session = supervisor.resolve_session(session_id)
-    tool_name = "idb_save" if session.backend == "gui" else "idalib_save"
-    result = supervisor.call_worker_tool(session, tool_name, {"path": ""})
+    tool_name = "idb_save"
+    save_path = str(Path(session.input_path).with_suffix(".i64"))
+    result = supervisor.call_worker_tool(session, tool_name, {"path": save_path})
     if not isinstance(result, dict):
         raise RuntimeError("Unexpected save result")
     if not result.get("ok"):
         error = result.get("error") or "Save failed"
         raise RuntimeError(str(error))
     return result
+
+
+def _cleanup_loose_db_files(i64_path: str, delete_i64: bool = False) -> None:
+    """Remove scattered .id0/.id1/.id2/.nam/.til loose files, and optionally the .i64."""
+    if not i64_path or not i64_path.endswith(".i64"):
+        return
+    base = i64_path[:-4]  # strip .i64
+    for ext in (".id0", ".id1", ".id2", ".nam", ".til"):
+        try:
+            os.remove(base + ext)
+        except OSError:
+            pass
+    if delete_i64:
+        try:
+            os.remove(i64_path)
+        except OSError:
+            pass
+
+
+
 
 
 def _build_request_handler(upstream):
@@ -294,38 +360,47 @@ def _build_request_handler(upstream):
             if parsed.path == "/api/instances":
                 if not self._check_api_request():
                     return
-                self._send_json(200, _snapshot_instances(self._supervisor()))
+                try:
+                    self._send_json(200, _snapshot_instances(self._supervisor()))
+                except Exception as exc:
+                    self._send_json(500, {"error": str(exc), "type": type(exc).__name__})
                 return
 
             history_match = re.match(r"^/api/instances/([^/]+)/history$", parsed.path)
             if history_match:
                 if not self._check_api_request():
                     return
-                session_id = unquote(history_match.group(1))
-                snapshot = self._history_snapshot(self._supervisor(), session_id)
-                if snapshot is None:
-                    self._send_json(404, {"error": f"No dispatcher for session: {session_id}"})
-                    return
-                self._send_json(200, snapshot)
+                try:
+                    session_id = unquote(history_match.group(1))
+                    snapshot = self._history_snapshot(self._supervisor(), session_id)
+                    if snapshot is None:
+                        self._send_json(200, {"current": None, "queued": [], "history": []})
+                        return
+                    self._send_json(200, snapshot)
+                except Exception as exc:
+                    self._send_json(500, {"error": str(exc), "type": type(exc).__name__})
                 return
 
             payload_match = re.match(r"^/api/instances/([^/]+)/history/([^/]+)$", parsed.path)
             if payload_match:
                 if not self._check_api_request():
                     return
-                session_id = unquote(payload_match.group(1))
-                payload_id = unquote(payload_match.group(2))
-                payload = self._history_payload(self._supervisor(), session_id, payload_id)
-                if payload is None:
-                    self._send_json(404, {"error": "Payload not found or evicted"})
-                    return
-                body = payload.encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_cors_headers()
-                self.end_headers()
-                self.wfile.write(body)
+                try:
+                    session_id = unquote(payload_match.group(1))
+                    payload_id = unquote(payload_match.group(2))
+                    payload = self._history_payload(self._supervisor(), session_id, payload_id)
+                    if payload is None:
+                        self._send_json(404, {"error": "Payload not found or evicted"})
+                        return
+                    body = payload.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_cors_headers()
+                    self.end_headers()
+                    self.wfile.write(body)
+                except Exception as exc:
+                    self._send_json(500, {"error": str(exc), "type": type(exc).__name__})
                 return
 
             super().do_GET()
@@ -353,9 +428,11 @@ def _build_request_handler(upstream):
                 options = self._read_json_body()
                 save_requested = bool(options.get("save"))
                 save_result = None
+                cleanup_path = ""
                 if save_requested:
                     try:
                         save_result = _save_session_before_close(supervisor, session_id)
+                        cleanup_path = save_result.get("path", "")
                     except KeyError:
                         self._send_json(404, {"success": False, "error": f"Session not found: {session_id}"})
                         return
@@ -369,11 +446,19 @@ def _build_request_handler(upstream):
                             },
                         )
                         return
+                else:
+                    try:
+                        session = supervisor.resolve_session(session_id)
+                        cleanup_path = str(Path(session.input_path).with_suffix(".i64"))
+                    except Exception:
+                        pass
                 try:
                     closed = supervisor.close_session(session_id)
                 except Exception as exc:
                     self._send_json(500, {"success": False, "error": str(exc)})
                     return
+                if closed:
+                    _cleanup_loose_db_files(cleanup_path, delete_i64=not save_requested)
                 status = 200 if closed else 404
                 self._send_json(
                     status,
@@ -385,6 +470,22 @@ def _build_request_handler(upstream):
                         "error": None if closed else f"Session not found: {session_id}",
                     },
                 )
+                return
+            save_suffix = "/save"
+            if parsed.path.startswith(prefix) and parsed.path.endswith(save_suffix):
+                if not self._check_api_request():
+                    return
+                session_id = unquote(parsed.path[len(prefix) : -len(save_suffix)])
+                if not session_id:
+                    self._send_json(400, {"ok": False, "error": "Missing session id"})
+                    return
+                try:
+                    result = _save_session_before_close(self._supervisor(), session_id)
+                    self._send_json(200, {"ok": True, "path": result.get("path", "")})
+                except KeyError:
+                    self._send_json(404, {"ok": False, "error": f"Session not found: {session_id}"})
+                except Exception as exc:
+                    self._send_json(500, {"ok": False, "error": str(exc)})
                 return
             super().do_POST()
 
@@ -681,6 +782,7 @@ def _build_request_handler(upstream):
         <td class="path" title="${inputPath}">${inputPath}</td>
         <td>
           <button data-inspect="${sessionId}">Inspect</button>
+          <button data-save="${sessionId}" ${session.is_active && session.owned ? '' : 'disabled'}>Save</button>
           <button class="danger" data-close="${sessionId}" ${session.owned === false ? 'disabled' : ''}>Close</button>
         </td>
       `;
@@ -728,10 +830,34 @@ def _build_request_handler(upstream):
       await refresh();
     }
 
+        async function saveSession(sessionId, button) {
+      button.disabled = true;
+            statusEl.textContent = `Saving ${sessionId}`;
+            try {
+                const response = await fetch(`/api/instances/${encodeURIComponent(sessionId)}/save`, {
+                    method: 'POST'
+                });
+                if (!response.ok) {
+                    const body = await response.text();
+                    throw new Error(body || response.statusText);
+                }
+                const data = await response.json();
+                statusEl.textContent = `Saved ${sessionId} → ${data.path || 'ok'}`;
+            } catch (error) {
+                statusEl.textContent = error.message;
+            }
+      button.disabled = false;
+    }
+
     rows.addEventListener('click', event => {
       const button = event.target.closest('button[data-close]');
       if (!button) return;
             showCloseDialog(button.dataset.close, button);
+        });
+        rows.addEventListener('click', event => {
+      const button = event.target.closest('button[data-save]');
+      if (!button) return;
+            saveSession(button.dataset.save, button);
         });
         cancelClose.addEventListener('click', hideCloseDialog);
         closeDialog.addEventListener('click', event => {
@@ -914,6 +1040,8 @@ def _enable_path_database_auto_open(upstream) -> None:
             if not candidate.exists():
                 raise
             context_id = supervisor.resolve_context_id()
+            # Clean up orphan loose files from a previous unclean shutdown
+            _cleanup_loose_db_files(str(candidate.with_suffix(".i64")))
             return supervisor.open_session(str(candidate), context_id=context_id)
 
     def _handle_tools_call_with_path_open(request_obj: dict[str, Any]) -> dict[str, Any] | None:
@@ -924,9 +1052,15 @@ def _enable_path_database_auto_open(upstream) -> None:
         tool_name = params.get("name", "")
         request_id = request_obj.get("id")
 
-        if tool_name in upstream.IDALIB_MANAGEMENT_TOOLS:
+        # Clean up orphan loose files from previous unclean shutdown
+        arguments = dict(params.get("arguments") or {})
+        _candidate = arguments.get("database") or arguments.get("input_path") or ""
+        if _candidate:
+            _cleanup_loose_db_files(str(Path(_candidate).with_suffix(".i64")))
+
+        if tool_name in upstream.IDB_MANAGEMENT_TOOLS:
             return upstream._original_dispatch(request_obj)
-        if tool_name in upstream.IDALIB_HIDDEN_PLUGIN_TOOLS:
+        if tool_name in getattr(upstream, "IDALIB_HIDDEN_PLUGIN_TOOLS", []):
             return upstream._jsonrpc_result(
                 request_id,
                 upstream._call_tool_result(
@@ -988,7 +1122,7 @@ def _register_open_ui_tool(upstream, *, host: str, port: int) -> None:
 
     idalib_open_ui.__doc__ = "Return the bound management UI URL."
     upstream.mcp.tool(idalib_open_ui)
-    upstream.IDALIB_MANAGEMENT_TOOLS.add("idalib_open_ui")
+    upstream.IDB_MANAGEMENT_TOOLS.add("idalib_open_ui")
 
 
 def _wrap_dispatch_supervisor(upstream) -> None:
